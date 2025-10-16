@@ -2,25 +2,24 @@
 import os
 import re
 import time
+import base64
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 import requests
 from openai import OpenAI
 from github import Github, GithubException
 
-## --- 1. SETUP AND CONFIGURATION ---
-
-# Load environment variables from your .env file
+# --- 1. SETUP AND CONFIGURATION ---
 
 # Fetch your secret keys and username from the environment
 MY_SECRET = os.getenv("MY_SECRET")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-OPENAI_API_KEY = os.getenv("LLM_API_KEY") # Ensure this name matches your .env file
-# ❗ IMPORTANT: Replace this with your actual GitHub username in quotes
-GITHUB_USERNAME = "mohdsamad83"  # e.g., "your-github-username"
+OPENAI_API_KEY = os.getenv("LLM_API_KEY") 
+# ❗ IMPORTANT: This MUST be the correct username for Pages URL construction
+GITHUB_USERNAME = "mohdsamad83" 
 
 # Check if all required secrets are set
-if not all([MY_SECRET, GITHUB_TOKEN, OPENAI_API_KEY, GITHUB_USERNAME != "YOUR_GITHUB_USERNAME"]):
+if not all([MY_SECRET, GITHUB_TOKEN, OPENAI_API_KEY, GITHUB_USERNAME]):
     raise ValueError("One or more required environment variables or GITHUB_USERNAME are not set.")
 
 # Initialize clients for the APIs we'll use
@@ -31,8 +30,7 @@ github_client = Github(GITHUB_TOKEN)
 
 ## --- 2. DATA MODELS ---
 
-# Defines the structure of the JSON request we expect to receive using Pydantic.
-# This ensures the incoming data is valid.
+# Defines the structure of the JSON request we expect to receive
 class TaskRequest(BaseModel):
     email: str
     secret: str
@@ -44,47 +42,87 @@ class TaskRequest(BaseModel):
     evaluation_url: str
     attachments: list = Field(default_factory=list)
 
+# --- NEW: Helper to construct the unique repository name ---
+def get_repo_name(task_id: str) -> str:
+    """Returns the unique repository name based on the task ID."""
+    # The requirement is to use a unique repo name based on .task.
+    return f"llm-code-deployer-{task_id}"
 
 ## --- 3. HELPER FUNCTIONS (The Core Logic) ---
 
-def generate_code_from_brief(brief: str, checks: list) -> dict:
-    """Calls the OpenAI API to generate code and documentation based on a prompt."""
-    print("🤖 Calling OpenAI to generate code...")
-    # This detailed prompt guides the LLM to produce the exact output format we need.
-    prompt = f"""
-    You are an expert web developer creating a complete, self-contained single-page web application.
-
-    BRIEF: "{brief}"
-    EVALUATION CHECKS: The final page must satisfy these requirements: {', '.join(checks)}.
-
-    Your response MUST contain exactly three markdown code blocks for the following files: index.html, README.md, and LICENSE.
-    The LICENSE block must contain the full text of the MIT License.
-    Do not write any other text, explanation, or introductions.
-
-    Use this exact format:
-    ```html
-    <!DOCTYPE html>
-    <html lang="en">
-    ...
-    </html>
-    ```
-
-    ```markdown
-    # Project Title
-    A brief summary of the project.
-    ```
-
-    ```text
-    MIT License
-    Copyright (c) {time.strftime('%Y')} {GITHUB_USERNAME}
-    Permission is hereby granted, free of charge, to any person obtaining a copy...
-    ... (the rest of the full MIT license text) ...
-    ```
+def generate_code_from_brief(brief: str, checks: list, existing_code: str = None) -> dict:
     """
+    Calls the OpenAI API to generate code/revision.
+    If existing_code is provided, the prompt is tailored for revision (Round 2).
+    """
+    print(f"🤖 Calling OpenAI for {'revision' if existing_code else 'initial generation'}...")
     
+    # --------------------------------------------------------------------------------
+    # 🔑 KEY LOGIC: Prompt Engineering for Round 1 vs. Round 2
+    # --------------------------------------------------------------------------------
+    if existing_code:
+        # Round 2: Instruct the LLM to modify the existing code
+        prompt = f"""
+        You are an expert web developer tasked with revising an existing single-page web application.
+
+        The ORIGINAL CODE (index.html) to be REVISED is provided below:
+        ---
+        {existing_code}
+        ---
+
+        REVISION BRIEF: "{brief}"
+        EVALUATION CHECKS: The final page must satisfy these new or updated requirements: {', '.join(checks)}.
+
+        Your response MUST contain exactly two markdown code blocks: one for the new index.html and one for the revised README.md.
+        Only include the full, complete, revised content for these two files. Do not include a LICENSE block.
+        Do not write any other text, explanation, or introductions.
+
+        Use this exact format for your output:
+        ```html
+        <!DOCTYPE html>
+        ... (FULL REVISED HTML) ...
+        ```
+
+        ```markdown
+        # Project Title - Revised
+        ... (FULL REVISED README CONTENT) ...
+        ```
+        """
+    else:
+        # Round 1: Instruct the LLM to generate the initial files
+        prompt = f"""
+        You are an expert web developer creating a complete, self-contained single-page web application.
+
+        BRIEF: "{brief}"
+        EVALUATION CHECKS: The final page must satisfy these requirements: {', '.join(checks)}.
+
+        Your response MUST contain exactly three markdown code blocks for the following files: index.html, README.md, and LICENSE.
+        The LICENSE block must contain the full text of the MIT License.
+        Do not write any other text, explanation, or introductions.
+
+        Use this exact format for your output:
+        ```html
+        <!DOCTYPE html>
+        <html lang="en">
+        ...
+        </html>
+        ```
+
+        ```markdown
+        # Project Title
+        A brief summary of the project.
+        ```
+
+        ```text
+        MIT License
+        ... (the rest of the full MIT license text) ...
+        ```
+        """
+    # --------------------------------------------------------------------------------
+
     try:
         completion = openai_client.chat.completions.create(
-            model="gpt-4o-mini", # Using a cost-effective and capable model
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}]
         )
         content = completion.choices[0].message.content
@@ -92,36 +130,48 @@ def generate_code_from_brief(brief: str, checks: list) -> dict:
         print(f"❌ OpenAI API call failed: {e}")
         raise
 
-    # Use regular expressions to safely extract content from each code block
+    # --------------------------------------------------------------------------------
+    # 🔑 KEY LOGIC: Parsing for Round 1 vs. Round 2
+    # --------------------------------------------------------------------------------
     html_match = re.search(r"```html\n(.*?)\n```", content, re.DOTALL)
     readme_match = re.search(r"```markdown\n(.*?)\n```", content, re.DOTALL)
-    license_match = re.search(r"```text\n(.*?)\n```", content, re.DOTALL)
-
-    if not all([html_match, readme_match, license_match]):
-        print("❌ Error: LLM response did not contain all three required code blocks.")
+    
+    if not html_match or not readme_match:
+        print("❌ Error: LLM response did not contain the required HTML and README blocks.")
         raise ValueError("Failed to parse LLM response. The output format was incorrect.")
-
-    print("✅ Code generated successfully.")
-    return {
+    
+    result = {
         "html": html_match.group(1).strip(),
         "readme": readme_match.group(1).strip(),
-        "license": license_match.group(1).strip(),
     }
+    
+    if not existing_code:
+        # Only check for LICENSE in Round 1
+        license_match = re.search(r"```text\n(.*?)\n```", content, re.DOTALL)
+        if not license_match:
+            print("❌ Error: LLM response did not contain the required LICENSE block for Round 1.")
+            raise ValueError("Failed to parse LLM response. The output format was incorrect for Round 1.")
+        result["license"] = license_match.group(1).strip()
+    
+    print("✅ Code generated/revised successfully.")
+    return result
 
-def create_and_deploy_repo(task_name: str, files: dict) -> dict:
-    """Creates a GitHub repo, uploads files, and constructs the Pages URL."""
-    print(f"🐙 Accessing GitHub to create repo: {task_name}")
+def create_and_deploy_repo(repo_name: str, files: dict) -> dict:
+    """Creates a GitHub repo, uploads files, and constructs the Pages URL (used only for Round 1)."""
+    print(f"🐙 Accessing GitHub to create repo: {repo_name}")
     user = github_client.get_user()
     
     try:
         # Create a new public repository.
-        repo = user.create_repo(task_name, private=False, auto_init=False)
-        print(f"✅ Repo '{task_name}' created.")
+        repo = user.create_repo(repo_name, private=False, auto_init=False)
+        print(f"✅ Repo '{repo_name}' created.")
     except GithubException as e:
-        # If the repo already exists (e.g., from a failed previous run), use it.
+        # If the repo already exists (e.g., from a failed previous run), we shouldn't proceed with Round 1
+        # The logic should be robust enough to handle the name collision, but for this project, 
+        # a failure means the instructor's script might retry Round 1.
         if e.status == 422:
-            print(f"⚠️ Repo '{task_name}' already exists. Proceeding with existing repo.")
-            repo = user.get_repo(task_name)
+            print(f"⚠️ Repo '{repo_name}' already exists. Failing Round 1 as expected.")
+            raise HTTPException(status_code=409, detail=f"Repository {repo_name} already exists. Cannot complete Round 1.")
         else:
             print(f"❌ GitHub API error: {e}")
             raise
@@ -132,8 +182,60 @@ def create_and_deploy_repo(task_name: str, files: dict) -> dict:
     repo.create_file("LICENSE", "docs: Add MIT License", files["license"], branch="main")
     print("✅ Files committed to the repo.")
 
-    # We need to wait a few seconds for GitHub to process the commit
     time.sleep(5) 
+    
+    commit_sha = repo.get_branch("main").commit.sha
+    pages_url = f"https://{user.login}.github.io/{repo.name}/"
+    
+    return {
+        "repo_url": repo.html_url,
+        "commit_sha": commit_sha,
+        "pages_url": pages_url
+    }
+
+def update_and_redeploy_repo(repo_name: str, files: dict) -> dict:
+    """Updates an EXISTING GitHub repo with new files (used only for Round 2)."""
+    print(f"🔄 Starting Round 2 revision for repo: {repo_name}")
+    user = github_client.get_user()
+    
+    try:
+        repo = user.get_repo(repo_name)
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Round 2 failed: Repository '{repo_name}' not found for revision.")
+
+    # 1. Update index.html
+    try:
+        contents_html = repo.get_contents("index.html")
+        repo.update_file(
+            contents_html.path, 
+            "feat: Round 2 code revision", 
+            files["html"], 
+            contents_html.sha, 
+            branch="main"
+        )
+        print("✅ index.html updated.")
+    except Exception as e:
+        print(f"❌ Failed to update index.html: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update application code (index.html) in repo.")
+
+    # 2. Update README.md
+    try:
+        contents_readme = repo.get_contents("README.md")
+        repo.update_file(
+            contents_readme.path, 
+            "docs: Round 2 README update", 
+            files["readme"], 
+            contents_readme.sha, 
+            branch="main"
+        )
+        print("✅ README.md updated.")
+    except Exception as e:
+        print(f"❌ Failed to update README.md: {e}")
+        # This is less critical than the code, but still necessary.
+        raise HTTPException(status_code=500, detail="Failed to update documentation (README.md) in repo.")
+
+    # Wait for the commit to process before getting the SHA
+    time.sleep(5)
     
     commit_sha = repo.get_branch("main").commit.sha
     pages_url = f"https://{user.login}.github.io/{repo.name}/"
@@ -146,9 +248,9 @@ def create_and_deploy_repo(task_name: str, files: dict) -> dict:
 
 def notify_evaluation_server(url: str, payload: dict):
     """Sends the final results back to the instructor's server with retries."""
-    print(f"📨 Notifying evaluation server at: {url}")
+    print(f"📨 Notifying evaluation server for Round {payload.get('round')} at: {url}")
     
-    # Retry with exponential backoff (1, 2, 4, 8 seconds) if the server is busy
+    # Retry with exponential backoff (1, 2, 4, 8 seconds)
     for i in range(4):
         try:
             response = requests.post(url, json=payload, timeout=20)
@@ -163,18 +265,41 @@ def notify_evaluation_server(url: str, payload: dict):
         time.sleep(2**i)
     
     print("❌ Failed to notify evaluation server after multiple retries.")
+    # Re-raise an exception so the FastAPI background task logs it as a failure
+    raise Exception("Failed to notify evaluation server.")
 
-def process_round_1_task(request_data: TaskRequest):
-    """The main workflow that runs in the background for a Round 1 task."""
-    print(f"🚀 Starting Round 1 processing for task: {request_data.task}")
+
+# --- New Function: Combined Background Processor ---
+def process_task(request_data: TaskRequest):
+    """The main workflow that runs in the background for either round."""
+    repo_name = get_repo_name(request_data.task)
+    print(f"🚀 Starting Round {request_data.round} processing for task: {repo_name}")
+    
     try:
-        # Step 1: Generate code using the LLM
-        generated_files = generate_code_from_brief(request_data.brief, request_data.checks)
+        if request_data.round == 1:
+            # --- ROUND 1: CREATE ---
+            generated_files = generate_code_from_brief(request_data.brief, request_data.checks)
+            repo_details = create_and_deploy_repo(repo_name, generated_files)
         
-        # Step 2: Create repo and deploy files to GitHub
-        repo_details = create_and_deploy_repo(request_data.task, generated_files)
+        elif request_data.round == 2:
+            # --- ROUND 2: REVISE ---
+            # 1. Get existing code to provide context to the LLM
+            user = github_client.get_user()
+            repo = user.get_repo(repo_name)
+            existing_contents = repo.get_contents("index.html")
+            existing_code = base64.b64decode(existing_contents.content).decode('utf-8')
+            
+            # 2. Generate the revised code and documentation
+            generated_files = generate_code_from_brief(request_data.brief, request_data.checks, existing_code=existing_code)
+            
+            # 3. Update the existing repo
+            repo_details = update_and_redeploy_repo(repo_name, generated_files)
         
-        # Step 3: Prepare the final JSON payload
+        else:
+            # Should be caught by the main endpoint, but good for safety.
+            raise ValueError(f"Invalid round number: {request_data.round}")
+
+        # --- FINAL STEP (COMMON TO BOTH ROUNDS) ---
         payload = {
             "email": request_data.email,
             "task": request_data.task,
@@ -185,11 +310,13 @@ def process_round_1_task(request_data: TaskRequest):
             "pages_url": repo_details["pages_url"],
         }
         
-        # Step 4: Send payload to the evaluation server
         notify_evaluation_server(request_data.evaluation_url, payload)
         
     except Exception as e:
-        print(f"❌ An unrecoverable error occurred during Round 1 processing: {e}")
+        print(f"❌ An unrecoverable error occurred during Round {request_data.round} processing: {e}")
+        # The instructor's server is designed to retry the POST to your API if this background task fails
+        # and you return a non-200. We don't re-raise here to avoid crashing the server.
+    
     print(f"🏁 Finished processing task: {request_data.task}")
 
 
@@ -205,19 +332,15 @@ async def handle_deployment(request_data: TaskRequest, background_tasks: Backgro
         print("❌ Secret mismatch. Aborting.")
         raise HTTPException(status_code=403, detail="Invalid secret provided.")
 
-    # Handle the task based on the round number
-    if request_data.round == 1:
+    # Check if the round is valid and add the task to the background
+    if request_data.round in [1, 2]:
         # Crucially, we add the slow work as a background task.
         # This allows us to return a 200 OK response immediately.
-        background_tasks.add_task(process_round_1_task, request_data)
-        return {"status": "success", "message": "Round 1 task accepted and is being processed in the background."}
+        background_tasks.add_task(process_task, request_data)
+        return {"status": "success", "message": f"Round {request_data.round} task accepted and is being processed in the background."}
     
-    elif request_data.round == 2:
-        # Placeholder for future logic
-        return {"status": "pending", "message": "Round 2 is not yet implemented."}
-            
     else:
-        raise HTTPException(status_code=400, detail="Invalid round number specified.")
+        raise HTTPException(status_code=400, detail="Invalid round number specified (must be 1 or 2).")
 
 @app.get("/")
 def read_root():
