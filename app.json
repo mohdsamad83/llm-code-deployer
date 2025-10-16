@@ -1,0 +1,7 @@
+{
+  "title": "LLM Code Deployer API",
+  "description": "An automated factory for generating and deploying web applications.",
+  "sdk": "docker",
+  "image": "python",
+  "port": 7860
+}
