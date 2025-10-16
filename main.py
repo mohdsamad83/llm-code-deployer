@@ -4,7 +4,6 @@ import re
 import time
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
 import requests
 from openai import OpenAI
 from github import Github, GithubException
@@ -12,7 +11,6 @@ from github import Github, GithubException
 ## --- 1. SETUP AND CONFIGURATION ---
 
 # Load environment variables from your .env file
-load_dotenv()
 
 # Fetch your secret keys and username from the environment
 MY_SECRET = os.getenv("MY_SECRET")
