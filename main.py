@@ -37,7 +37,6 @@ github_client = Github(GITHUB_TOKEN)
 ## --- 2. DATA MODELS ---
 
 # Defines the structure of the JSON request we expect to receive
-# NOTE: The attachments field is already correctly defined.
 class Attachment(BaseModel):
     name: str
     url: str
@@ -127,38 +126,43 @@ def generate_code_from_brief(
 ) -> dict:
     """
     Calls the OpenAI API (proxied via AIPipe) to generate code/revision.
-    Now accepts attachment blocks for multi-modal input.
+    Includes explicit instructions for using attachments and strict adherence to the output format.
     """
     print(f"🤖 Calling OpenAI (via AIPipe) for {'revision' if existing_code else 'initial generation'}...")
     
     # --- MODEL SELECTION ---
-    # NOTE: 'openai/gpt-4o-mini' supports vision, so no model change needed!
-    MODEL_NAME = "openai/gpt-4o-mini"
-    # --------------------------------------------------------------------------------
+    # Using the multi-modal model to handle both image (vision) and text attachments.
+    MODEL_NAME = "openai/gpt-4o-mini" 
     
-    # Base Instruction for the LLM
+    # --- Base Instruction Template (Hardened) ---
     base_instruction = f"""
-    You are an expert web developer. The task is to create or revise a complete, self-contained single-page web application.
+    You are an expert, highly precise, and efficient web developer. Your goal is to write a single-page, self-contained web application (HTML/CSS/JS) that perfectly meets the user's requirements.
+
+    CRITICAL RULES:
+    1. STRICT FORMAT: Your response MUST contain ONLY the required markdown code blocks and nothing else.
+    2. SINGLE FILE: The application logic MUST be self-contained within the <script> tags of index.html. Do not create separate .js or .css files.
+    3. ATTACHMENT USE: If data files (CSV, JSON, MD, etc.) are provided below, your JavaScript code MUST load and process them (using `fetch(filename)`) as part of the app logic. If an image is provided, generate code based on the image's appearance or content as requested in the brief.
 
     BRIEF: "{brief}"
-    EVALUATION CHECKS: The final page must satisfy these requirements: {', '.join(checks)}.
+    EVALUATION CHECKS: The final page must satisfy these functional requirements: {', '.join(checks)}.
 
-    {attachment_text_context}
-    
-    Your response MUST ONLY contain the required markdown code blocks. Do not write any other text, explanation, or introductions.
+    --- ATTACHMENT DATA CONTEXT ---
+    {attachment_text_context if attachment_text_context else "No text/data files were provided."}
+    --- END CONTEXT ---
     """
     
     if existing_code:
         # Round 2: Instruct the LLM to modify the existing code
         prompt_text = base_instruction + f"""
         
-        The ORIGINAL CODE (index.html) to be REVISED is provided below:
+        TASK MODE: REVISION (Round 2)
+        The ORIGINAL CODE (index.html) to be REVISED is provided below. You MUST read this code to apply the revisions correctly.
         ---
         {existing_code}
         ---
 
-        Your response MUST contain exactly two markdown code blocks: one for the new index.html and one for the revised README.md.
-        Only include the full, complete, revised content for these two files. Do not include a LICENSE block.
+        Your response MUST contain exactly two markdown code blocks: one for the **new index.html** and one for the **revised README.md**.
+        Do not include a LICENSE block.
 
         Use this exact format for your output:
         ```html
@@ -176,8 +180,10 @@ def generate_code_from_brief(
         # Round 1: Instruct the LLM to generate the initial files
         prompt_text = base_instruction + f"""
         
-        Your response MUST contain exactly three markdown code blocks for the following files: index.html, README.md, and LICENSE.
-        The LICENSE block must contain the full text of the MIT License.
+        TASK MODE: CREATION (Round 1)
+        
+        Your response MUST contain exactly three markdown code blocks for the following files: **index.html**, **README.md**, and **LICENSE**.
+        The LICENSE block must contain the full text of the MIT License, which is publicly available.
 
         Use this exact format for your output:
         ```html
@@ -189,7 +195,7 @@ def generate_code_from_brief(
 
         ```markdown
         # Project Title
-        A brief summary of the project.
+        A brief summary of the project. Include setup, usage, code explanation, and license mention.
         ```
 
         ```text
@@ -198,11 +204,9 @@ def generate_code_from_brief(
         ```
         """
 
-    # --- Construct the messages list for the LLM ---
-    # 1. Add the prompt text block
+    # --- Construct the messages list for the LLM (Vision/Text) ---
     content_blocks = [{"type": "text", "text": prompt_text}]
-    
-    # 2. Add any image attachments (they go *before* the text in the message)
+    # The message sent to the API is a list containing image objects and the final text prompt
     final_message_content = attachment_blocks + content_blocks
 
     try:
@@ -215,10 +219,14 @@ def generate_code_from_brief(
         print(f"❌ OpenAI API call (via AIPipe) failed: {e}")
         raise
 
-    # ... (Parsing logic remains the same) ...
+    # ... (Rest of the file parsing logic remains the same) ...
+    # This logic is robust and relies on the LLM following the strict format.
     html_match = re.search(r"```html\n(.*?)\n```", content, re.DOTALL)
     readme_match = re.search(r"```markdown\n(.*?)\n```", content, re.DOTALL)
     
+    # ... (Final checks and return) ...
+    
+    # Rest of your existing parsing logic goes here...
     if not html_match or not readme_match:
         print("❌ Error: LLM response did not contain the required HTML and README blocks.")
         raise ValueError("Failed to parse LLM response. The output format was incorrect.")
@@ -296,7 +304,6 @@ def create_and_deploy_repo(repo_name: str, files: dict) -> dict:
 
 def update_and_redeploy_repo(repo_name: str, files: dict) -> dict:
     """Updates an EXISTING GitHub repo with new files (used only for Round 2)."""
-    # ... (Logic remains mostly the same as your original, just need to handle new attachments) ...
     print(f"🔄 Starting Round 2 revision for repo: {repo_name}")
     user = github_client.get_user()
     
