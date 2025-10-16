@@ -22,7 +22,7 @@ OPENAI_API_KEY = os.getenv("LLM_API_KEY") # Ensure this name matches your .env f
 GITHUB_USERNAME = "mohdsamad83"  # e.g., "your-github-username"
 
 # Check if all required secrets are set
-if not all([MY_SECRET, GITHUB_TOKEN, OPENAI_API_KEY, GITHUB_USERNAME != "mohdsamad83"]):
+if not all([MY_SECRET, GITHUB_TOKEN, OPENAI_API_KEY, GITHUB_USERNAME != "YOUR_GITHUB_USERNAME"]):
     raise ValueError("One or more required environment variables or GITHUB_USERNAME are not set.")
 
 # Initialize clients for the APIs we'll use
