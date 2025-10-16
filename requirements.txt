@@ -1,15 +1,4 @@
-# For the web server
 fastapi
-uvicorn
-
-# For reading the .env file
-python-dotenv
-
-# For making HTTP requests (to the evaluation URL)
 requests
-
-# For talking to the GitHub API
 PyGithub
-
-# For talking to the OpenAI API
 openai
