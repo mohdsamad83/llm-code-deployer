@@ -1,4 +1,3 @@
-# main.py
 import os
 import re
 import time
@@ -6,7 +5,8 @@ import base64
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 import requests
-from openai import OpenAI
+# Using the standard OpenAI client as required by your original code
+from openai import OpenAI 
 from github import Github, GithubException
 
 # --- 1. SETUP AND CONFIGURATION ---
@@ -14,9 +14,14 @@ from github import Github, GithubException
 # Fetch your secret keys and username from the environment
 MY_SECRET = os.getenv("MY_SECRET")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+# NOTE: This LLM_API_KEY should now be generated from aipipe.org
 OPENAI_API_KEY = os.getenv("LLM_API_KEY") 
 # ❗ IMPORTANT: This MUST be the correct username for Pages URL construction
 GITHUB_USERNAME = "mohdsamad83" 
+
+# --- NEW: AIPipe Configuration ---
+# Set the base URL to AIPipe's OpenRouter-compatible endpoint
+AIPipe_BASE_URL = "https://aipipe.org/openrouter/v1" 
 
 # Check if all required secrets are set
 if not all([MY_SECRET, GITHUB_TOKEN, OPENAI_API_KEY, GITHUB_USERNAME]):
@@ -24,7 +29,8 @@ if not all([MY_SECRET, GITHUB_TOKEN, OPENAI_API_KEY, GITHUB_USERNAME]):
 
 # Initialize clients for the APIs we'll use
 app = FastAPI()
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+# 🔑 CRITICAL CHANGE: Initialize OpenAI client with the AIPipe base_url
+openai_client = OpenAI(api_key=OPENAI_API_KEY, base_url=AIPipe_BASE_URL)
 github_client = Github(GITHUB_TOKEN)
 
 
@@ -52,11 +58,14 @@ def get_repo_name(task_id: str) -> str:
 
 def generate_code_from_brief(brief: str, checks: list, existing_code: str = None) -> dict:
     """
-    Calls the OpenAI API to generate code/revision.
+    Calls the OpenAI API (proxied via AIPipe) to generate code/revision.
     If existing_code is provided, the prompt is tailored for revision (Round 2).
     """
-    print(f"🤖 Calling OpenAI for {'revision' if existing_code else 'initial generation'}...")
+    print(f"🤖 Calling OpenAI (via AIPipe) for {'revision' if existing_code else 'initial generation'}...")
     
+    # --- MODEL SELECTION ---
+    # Using the fully qualified model name for AIPipe/OpenRouter compatibility.
+    MODEL_NAME = "openai/gpt-4o-mini"
     # --------------------------------------------------------------------------------
     # 🔑 KEY LOGIC: Prompt Engineering for Round 1 vs. Round 2
     # --------------------------------------------------------------------------------
@@ -122,12 +131,12 @@ def generate_code_from_brief(brief: str, checks: list, existing_code: str = None
 
     try:
         completion = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=MODEL_NAME, # 🔑 CRITICAL CHANGE: Using the prefixed model name
             messages=[{"role": "user", "content": prompt}]
         )
         content = completion.choices[0].message.content
     except Exception as e:
-        print(f"❌ OpenAI API call failed: {e}")
+        print(f"❌ OpenAI API call (via AIPipe) failed: {e}")
         raise
 
     # --------------------------------------------------------------------------------
@@ -166,9 +175,7 @@ def create_and_deploy_repo(repo_name: str, files: dict) -> dict:
         repo = user.create_repo(repo_name, private=False, auto_init=False)
         print(f"✅ Repo '{repo_name}' created.")
     except GithubException as e:
-        # If the repo already exists (e.g., from a failed previous run), we shouldn't proceed with Round 1
-        # The logic should be robust enough to handle the name collision, but for this project, 
-        # a failure means the instructor's script might retry Round 1.
+        # If the repo already exists, fail Round 1
         if e.status == 422:
             print(f"⚠️ Repo '{repo_name}' already exists. Failing Round 1 as expected.")
             raise HTTPException(status_code=409, detail=f"Repository {repo_name} already exists. Cannot complete Round 1.")
@@ -182,8 +189,10 @@ def create_and_deploy_repo(repo_name: str, files: dict) -> dict:
     repo.create_file("LICENSE", "docs: Add MIT License", files["license"], branch="main")
     print("✅ Files committed to the repo.")
 
+    # Giving GitHub Pages a moment to initialize the site build
     time.sleep(5) 
     
+    # Construct the GitHub Pages URL based on the GITHUB_USERNAME defined in setup
     commit_sha = repo.get_branch("main").commit.sha
     pages_url = f"https://{user.login}.github.io/{repo.name}/"
     
@@ -286,7 +295,10 @@ def process_task(request_data: TaskRequest):
             # 1. Get existing code to provide context to the LLM
             user = github_client.get_user()
             repo = user.get_repo(repo_name)
+            
+            # Fetch the contents of the existing index.html
             existing_contents = repo.get_contents("index.html")
+            # The content is base64 encoded, so it must be decoded
             existing_code = base64.b64decode(existing_contents.content).decode('utf-8')
             
             # 2. Generate the revised code and documentation
@@ -313,9 +325,8 @@ def process_task(request_data: TaskRequest):
         notify_evaluation_server(request_data.evaluation_url, payload)
         
     except Exception as e:
+        # Log the critical failure, but allow the server to continue running.
         print(f"❌ An unrecoverable error occurred during Round {request_data.round} processing: {e}")
-        # The instructor's server is designed to retry the POST to your API if this background task fails
-        # and you return a non-200. We don't re-raise here to avoid crashing the server.
     
     print(f"🏁 Finished processing task: {request_data.task}")
 
@@ -335,7 +346,8 @@ async def handle_deployment(request_data: TaskRequest, background_tasks: Backgro
     # Check if the round is valid and add the task to the background
     if request_data.round in [1, 2]:
         # Crucially, we add the slow work as a background task.
-        # This allows us to return a 200 OK response immediately.
+        # This allows us to return a 200 OK response immediately, which is essential
+        # for not blocking the external evaluation server.
         background_tasks.add_task(process_task, request_data)
         return {"status": "success", "message": f"Round {request_data.round} task accepted and is being processed in the background."}
     
